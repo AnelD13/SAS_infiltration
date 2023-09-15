@@ -3,7 +3,7 @@
 *********************************/
 /* set library / directory name - optional but will make sure that all inputs and outputs run
 from and to this directory  */
-libname InfiltrationFolder 'C:\Users\aneld\OneDrive\Documents\My SAS Files\Infiltration';
+libname libref 'C:\Users\aneld\OneDrive\Documents\My SAS Files\Infiltration';
 
 /* Use proc import instead of copying data set into SAS*/
 title Infiltration Raw;
@@ -24,7 +24,7 @@ CALCULATE SORPTIVITY AND Kfs VALUES
 title Calculate slope and intercept values;
 /* create empty data frame */
 data InfilNewData;
-  length Block $6 Treatment $ 15. Slope 4 Kfs 4; /* Define variable types and lengths */
+  length Block $6 Treatment $ 25. Slope 4 Kfs 4; /* Define variable types and lengths */
   keep Block Treatment Slope Kfs;
   stop;
 run;
@@ -159,6 +159,11 @@ proc import out=infiltration
 	options msglevel=i;
 run;
 
+data infiltration;
+	length Block $ 6 Treatment $ 25; */make sure it's longer than needed in case of later renaming*/
+	set infiltration; /*set data table only after the legth has been specified */
+run;
+
 proc print data=infiltration;
 run;
 
@@ -190,66 +195,99 @@ run;
 /*************
 Model the data
 *************/
-proc means data=InfilDF;
-  by Treatment Block;
-  var Sorptivity Kfs;
-  output out=SummaryData(drop=_TYPE_ _FREQ_) mean(Sorptivity Kfs)=;
-run;
 
-/* Define a macro to run the non-linear model for each Treatment group */
-options spool;
-%macro run_model(treatment, block, time, ci, s, k);
-data temp;/* Create local macro variables */
-	merge infiltration  (where=(Treatment = "&treatment" and Block = "&block"))
-		InfilNewData  (where=(Treatment = "&treatment" and Block = "&block"));
-	by Treatment Block;
-	Time = &time;
-	CI = &ci;
-	Sorptivity = &s;
-	Kfs = &k;
-run;
-proc nlin data=temp;
-	parms Sorptivity = &s Kfs = &k;
+proc nlin data=InfilDF;
+	parms Sorptivity=0.01 Kfs=0.01;
 	model CI = Sorptivity * sqrt(Time) + Kfs;
-	output out=PredictedCI_&treatment Block=Block Time=Time CI=CI Sorptivity=Sorptivity Kfs=Kfs predicted=PredictedCI;
+	by Treatment Block;
+	output out=PredictedResults predicted=PredictedCI;
 run;
-data PredictedCI_&treatment;/* Add a Treatment group identifier to the output */
-	set PredictedCI_&treatment;
-	Treatment = "&treatment";
-	Block = "&block";
+data InfilPredicted;
+	retain Block Treatment Time CI Infiltration Sorptivity Kfs; /* I had to do this as my Time 
+				variable showed up empty*/
+	merge InfilDF PredictedResults;
+    by Treatment Block;
 run;
-%mend;
-
-%macro run_all_models;
-%local treatment_list block_list s_list k_list time_list ci_list;
-/* Create macro variable lists within the macro */
-proc sql noprint;
-  select distinct Treatment into :treatment_list separated by ' ' from InfilDF;
-  select distinct Block into :block_list separated by ' ' from InfilDF;
-  select distinct Sorptivity into :s_list separated by ' ' from InfilNewData;
-  select distinct Kfs into :k_list separated by ' ' from InfilNewData;
-  select distinct Time into :time_list separated by ' ' from InfilDF;
-  select distinct CI into :ci_list separated by ' ' from InfilDF;
-quit;
-/* Loop over the macro variables and run the models */
-%do i = 1 %to %sysfunc(countw(&treatment_list));
-	%let current_treatment = %scan(&treatment_list, &i);
-	%let current_block = %scan(&block_list, &i);
-	%let current_s = %scan(&s_list, &i);
-	%let current_k = %scan(&k_list, &i);
-	%let current_time = %scan(&time_list, &i);
-	%let current_ci = %scan(&ci_list, &i);
-	%run_model(&current_treatment, &current_block, &current_time, &current_ci, &current_s, &current_k);
-	proc print data=PredictedCI_&current_treatment;
-	run;
-%end;
-%mend;
-
-%run_all_models;
+proc sort data=InfilPredicted;
+by Treatment Block Time;
+run;
+proc print data=InfilPredicted;
+run;
+proc export data=InfilPredicted
+  outfile='Infiltration_PredictedCI.xlsx'
+  dbms=xlsx replace;
+  sheet='Sheet1';
+run;
 
 
+/**************************
+Plot the infiltration curve
+**************************/
+/* transpose data so all values are within one column */
+proc transpose data=InfilPredicted out=Infil_long;
+  by Treatment Block Time;
+  var Infiltration CI PredictedCI;
+run;
+/* rename Treatment labels */
+proc format; /* no need to repeat this, I just did it for ease of reference */
+  value $ TreatmentFmt max.
+    "Control1" = "Control_1"
+    "Control2" = "Control_2"
+    "Biochar25kgPha" = "Biochar_25kg_P/ha"
+	"Biochar10tha" = "Biochar_10t/ha"
+    "Biochar10thaTSP" = "Biochar_10t/ha_&_TSP" /*issue with recognising this and B10t/ha
+				as diffeernt strings so _ is used*/
+	"Phosphorus" = "TSP_Fertilizer";
+run;
+/* set new labels in long format table */
+data Infil_long;
+	set Infil_long;
+	format Treatment $TreatmentFmt.;
+run;
+proc print data=Infil_long;
+run;
+proc freq data=Infil_long; /* Check unique levels of treatment */
+  tables Treatment / out=TreatmentLevels(keep=Treatment);
+run;
+
+/* Save the plot as an image file */
+ods graphics on / 
+	width=20in /* play with sizes to change output*/
+	height=16in
+	outputfmt=png
+	imagemap=on
+	imagename = 'InfiltrationCurves';
+proc sgpanel data=Infil_long;
+  panelby Treatment / columns=3 uniscale=all novarname ; /*novarname removes the 'treatment' label */
+  loess x=Time y=COL1 / group=_NAME_ smooth=0.5 lineattrs=(pattern=1) nomarkers; 
+		/*higher number for 'smooth' will increase the look of the line (very staggered with lower numbers) */
+	styleattrs datacontrastcolors= (red green black);
+	colaxis label="Time (hours)";
+  rowaxis label="Infiltration (cm)";
+  keylegend / title="Legend";
+run;
+ods graphics off;
 
 
+/*********************************
+  Predicted CI to specific time
+**********************************/
+/* to cut off the predicted values at for example 2 hours, use the following */
+data Infil_long_filtered;
+  set Infil_long;
+  where Time <= 2;
+run;
+proc print data=Infil_long_filtered;
+run;
+proc sgpanel data=Infil_long_filtered;
+  panelby Treatment / columns=3 uniscale=all novarname ; /*novarname removes the 'treatment' label */
+  loess x=Time y=COL1 / group=_NAME_ smooth=0.5 lineattrs=(pattern=1) nomarkers; 
+		/*higher number for 'smooth' will increase the look of the line (very staggered with lower numbers) */
+	styleattrs datacontrastcolors= (red green black);
+	colaxis label="Time (hours)";
+  rowaxis label="Infiltration (cm)";
+  keylegend / title="Legend";
+run;
 
 
 /********************************
